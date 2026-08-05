@@ -1,0 +1,718 @@
+{
+  "name": "AI Inbox Autopilot — Email Triage & Drafter",
+  "nodes": [
+    {
+      "id": "a1",
+      "name": "Gmail Trigger",
+      "type": "n8n-nodes-base.gmailTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -1360,
+        300
+      ],
+      "parameters": {
+        "pollTimes": {
+          "item": [
+            {
+              "mode": "everyMinute"
+            }
+          ]
+        },
+        "simple": false,
+        "filters": {
+          "q": "-from:me -in:chats"
+        },
+        "options": {}
+      },
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "REPLACE_GMAIL",
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "id": "b2",
+      "name": "Prepare Email",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1160,
+        300
+      ],
+      "parameters": {
+        "jsCode": "const j = $input.item.json;\nfunction parseStr(s){ s=String(s||''); const m=s.match(/<([^>]+)>/); const email=(m?m[1]:s).replace(/^[\"']|[\"']$/g,'').trim(); const name=s.replace(/<[^>]+>/,'').replace(/[\"']/g,'').trim()||email; return {email,name}; }\n// Gmail nodes return From/To in several shapes across versions (string, {value:[{address,name}]}, {address}, payload.headers). This handles all of them.\nfunction addr(x){ if(!x) return {email:'',name:''}; if(typeof x==='string') return parseStr(x); if(Array.isArray(x)) return x[0]?{email:x[0].address||'',name:x[0].name||x[0].address||''}:{email:'',name:''}; if(Array.isArray(x.value)&&x.value[0]) return {email:x.value[0].address||'',name:x.value[0].name||x.value[0].address||''}; if(x.address) return {email:x.address,name:x.name||x.address}; if(x.text) return parseStr(x.text); return {email:'',name:''}; }\nconst F=addr(j.From||j.from);\nconst fromEmail=F.email; const fromName=F.name||fromEmail;\nconst subject=String(j.Subject||j.subject||'(no subject)');\nconst body=String(j.text||j.textPlain||j.snippet||j.html||'').replace(/<[^>]+>/g,' ').slice(0,6000);\nconst threadId=j.threadId||(j.payload&&j.payload.threadId)||'';\n// EDIT this noise list for your inbox:\nconst noiseRe=/(no-?reply|noreply|donotreply|do-not-reply|notifications?|mailer-daemon|postmaster|newsletter|automated|bounce|mailchimp|klaviyo)/i;\nreturn [{ json:{ fromEmail, fromName, subject, body, threadId, prefilterNoise:noiseRe.test(fromEmail) } }];"
+      }
+    },
+    {
+      "id": "c3",
+      "name": "Build Classify Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -960,
+        300
+      ],
+      "parameters": {
+        "jsCode": "const e=$json; const system=\"You are an email triage classifier for {{BRAND_NAME}} ({{ONE_LINE_DESCRIPTION}}). Classify the single inbound email. Return ONLY minified JSON, no prose, with exactly these keys:\\nsegment: one of [\\\"customer\\\",\\\"reseller_b2b\\\",\\\"investor\\\",\\\"ops_logistics\\\",\\\"press\\\",\\\"noise\\\"]   // EDIT this list to match your business\\nintent: one of [\\\"order_status\\\",\\\"product_question\\\",\\\"return_refund\\\",\\\"wholesale_enquiry\\\",\\\"complaint\\\",\\\"billing\\\",\\\"investor\\\",\\\"press\\\",\\\"general\\\"]   // EDIT\\npriority: \\\"P1\\\" (hot / time-sensitive), \\\"P2\\\" (needs care), \\\"P3\\\" (routine), \\\"P4\\\" (low)\\nsentiment: one of [\\\"positive\\\",\\\"neutral\\\",\\\"frustrated\\\",\\\"at_risk\\\"]\\nis_noise: true for automated notifications, receipts, newsletters, cold sales pitches, or self-sent mail\\nneeds_order_lookup: true only if a customer is asking about a specific existing order, return, or tracking\\ncustomer_email: the sender's email address if needs_order_lookup is true, else \\\"\\\"\\n// EDIT: describe each segment/intent for your brand, and add routing rules (e.g. investor => segment \\\"investor\\\").\";\nconst user=`From: ${e.fromName} <${e.fromEmail}>\\nSubject: ${e.subject}\\n\\n${e.body}`;\n// Haiku = cheap classifier. Swap model string for your provider/model if needed.\nreturn [{ json:{ anthropicBody:{ model:'claude-haiku-4-5-20251001', max_tokens:400, system, messages:[{role:'user',content:user}] } } }];"
+      }
+    },
+    {
+      "id": "d4",
+      "name": "Claude Classify",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -760,
+        300
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json.anthropicBody }}",
+        "options": {}
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_ANTHROPIC",
+          "name": "Anthropic API (x-api-key)"
+        }
+      }
+    },
+    {
+      "id": "e5",
+      "name": "Parse Classification",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -560,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// Claude may return a 'thinking' block before the 'text' block — never assume content[0]. Find the text block.\nconst blocks = Array.isArray($json.content) ? $json.content : [];\nlet t = (blocks.find(b => b && b.type === 'text') || {}).text || '{}';\nt = t.replace(/```json/gi,'').replace(/```/g,'').trim();\nlet c; try{c=JSON.parse(t);}catch(e){c={segment:'customer',intent:'general',priority:'P2',sentiment:'neutral',is_noise:false,needs_order_lookup:false,customer_email:''};}\nreturn [{ json:c }];"
+      }
+    },
+    {
+      "id": "f6",
+      "name": "IF Actionable",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        -360,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ (!$json.is_noise) && (!$('Prepare Email').item.json.prefilterNoise) }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "p6",
+      "name": "Skip (Noise)",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        -160,
+        520
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "t1",
+      "name": "Gmail: Get Thread",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        -160,
+        220
+      ],
+      "parameters": {
+        "resource": "thread",
+        "operation": "get",
+        "threadId": "={{ $('Prepare Email').item.json.threadId }}",
+        "options": {
+          "returnOnlyMessages": true
+        }
+      },
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "REPLACE_GMAIL",
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "id": "t2",
+      "name": "Summarise Thread History",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        40,
+        220
+      ],
+      "parameters": {
+        "jsCode": "const items=$input.all().map(i=>i.json); let msgs=[];\nif(items.length===1&&Array.isArray(items[0].messages))msgs=items[0].messages; else msgs=items;\nfunction parseStr(s){ s=String(s||''); const m=s.match(/<([^>]+)>/); return (m?m[1]:s).trim(); }\nfunction who(m){ const x=m.From||m.from; if(!x)return ''; if(typeof x==='string')return parseStr(x); if(Array.isArray(x.value)&&x.value[0])return x.value[0].name||x.value[0].address||''; if(x.address)return x.name||x.address; if(x.text)return parseStr(x.text); if(m.headers&&m.headers.from)return parseStr(m.headers.from); const H=(m.payload&&m.payload.headers)||[]; const f=H.find(h=>h.name&&h.name.toLowerCase()==='from'); return f?parseStr(f.value):''; }\nconst rows=msgs.map(m=>{ const from=who(m); const date=m.date||m.internalDate||''; const text=String(m.snippet||m.text||'').replace(/\\s+/g,' ').slice(0,300); return `${date} | ${from}: ${text}`; }).filter(r=>r.replace(/[^a-z0-9]/gi,'').length>3);\nconst threadHistory = rows.slice(-8).join('\\n') || 'No prior messages in this thread (first contact).';\nreturn [{ json:{ ...$('Parse Classification').item.json, threadHistory } }];"
+      }
+    },
+    {
+      "id": "x1",
+      "name": "Google Sheets: Read Ops Facts",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        240,
+        220
+      ],
+      "parameters": {
+        "resource": "sheet",
+        "operation": "read",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "REPLACE_SHEET_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "facts"
+        },
+        "options": {}
+      },
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_GSHEETS",
+          "name": "Google Sheets"
+        }
+      }
+    },
+    {
+      "id": "x2",
+      "name": "Compose Ops Facts",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        440,
+        220
+      ],
+      "parameters": {
+        "jsCode": "const rows=$input.all().map(i=>i.json);\nconst get=k=>{ const r=rows.find(r=>String(r.key||'').trim()===k); return r?String(r.value||'').trim():''; };\nconst opsManual=get('manual_status')||'(none set)';\nconst opsAuto=get('auto_facts')||'No current operational notes.';\nreturn [{ json:{ ...$('Summarise Thread History').item.json, opsManual, opsAuto } }];"
+      }
+    },
+    {
+      "id": "g7",
+      "name": "IF Needs Order",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        640,
+        220
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "c2",
+              "leftValue": "={{ $json.needs_order_lookup }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "h8",
+      "name": "Store: Get Orders (example)",
+      "type": "n8n-nodes-base.wooCommerce",
+      "typeVersion": 1,
+      "position": [
+        860,
+        140
+      ],
+      "parameters": {
+        "resource": "order",
+        "operation": "getAll",
+        "returnAll": false,
+        "limit": 3,
+        "filters": {
+          "search": "={{ $('Parse Classification').item.json.customer_email }}"
+        }
+      },
+      "credentials": {
+        "wooCommerceApi": {
+          "id": "REPLACE_STORE",
+          "name": "Store API (WooCommerce example)"
+        }
+      }
+    },
+    {
+      "id": "i9",
+      "name": "Code: Order Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1060,
+        140
+      ],
+      "parameters": {
+        "jsCode": "// EDIT: adapt to your store's order shape (this example matches WooCommerce).\nconst orders=$input.all().map(i=>i.json).filter(o=>o&&(o.id||o.number)); let ctx;\nif(orders.length){ const o=orders[0]; const items=(o.line_items||[]).map(li=>`${li.quantity}x ${li.name}`).join(', '); ctx=`Most recent order #${o.number||o.id}: status=${o.status}, placed=${o.date_created}, total=${o.currency||''}${o.total}, items=[${items}].`; }\nelse { ctx='No matching order found — the draft must politely ask for the order number rather than guessing.'; }\nreturn [{ json:{ orderContext:ctx } }];"
+      }
+    },
+    {
+      "id": "j0",
+      "name": "Set: No Order Context",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        860,
+        300
+      ],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a1",
+              "name": "orderContext",
+              "value": "",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "k1",
+      "name": "Build Draft Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1280,
+        220
+      ],
+      "parameters": {
+        "jsCode": "const e=$('Prepare Email').item.json;\nconst c=$('Parse Classification').item.json;\nconst th=$('Summarise Thread History').item.json.threadHistory||'No prior messages.';\nconst of=$('Compose Ops Facts').item.json;\nconst orderContext=$json.orderContext||'';\nconst system=\"You draft an email reply AS {{BRAND_NAME}}. Voice: {{VOICE_GUIDELINES — e.g. warm, plain-language, human; no corporate stiffness; no emoji unless they used one}}. Lead with the person's situation, not features. Short and human.\\n\\nCURRENT-STATUS PRIORITY (most authoritative first) — this is the reusable pattern, keep it:\\n1) MANUAL STATUS — facts a human set by hand (stock, promos, delays). Ground truth. Never contradict it.\\n2) THIS THREAD'S HISTORY — what we already told THIS person. Stay consistent.\\n3) RECENT OPERATIONAL NOTES — auto-detected from our recent sent mail (what we told OTHER people this week). Use to stay consistent, but if a reply depends on one of these, set needs_founder_input=true so a human confirms.\\nNewer information always beats older. Never contradict MANUAL STATUS.\\n\\nGUARDRAILS (hard) — EDIT for your brand:\\n- Only state facts from BRAND CONTEXT, MANUAL STATUS, RECENT OPERATIONAL NOTES, ORDER CONTEXT, or THREAD HISTORY. If you lack a fact, do NOT invent it — say you'll confirm, or ask.\\n- Never invent an order number, tracking, ship date, price, or quantities.\\n- For {{SENSITIVE_TOPICS — e.g. pricing, discounts, contracts}}: set needs_founder_input=true.\\n- {{ADD YOUR OWN NON-NEGOTIABLES — restricted words, competitor policy, regulated claims, escalation rules}}.\\n\\n=== BRAND CONTEXT (REPLACE THIS ENTIRE BLOCK with your own customer-safe facts. Never put confidential data here — it can surface in a reply.) ===\\nABOUT: {{WHAT YOUR BUSINESS DOES, tagline, website}}\\nPRODUCTS/SERVICES: {{KEY FACTS a reply may need}}\\nPRICING: {{PUBLIC PRICING ONLY. Keep confidential/wholesale pricing out, or gate it behind needs_founder_input}}\\nPOLICIES: Shipping: {{...}} | Returns: {{...}} | Warranty: {{...}}\\n{{OPTIONAL: paste your FAQ Q&As here, or add a node that fetches them}}\\n=== END BRAND CONTEXT ===\\n\\nReturn ONLY minified JSON: {\\\"subject\\\":\\\"...\\\",\\\"body\\\":\\\"...\\\",\\\"needs_founder_input\\\":true|false,\\\"medical_flag\\\":false}. \\\"body\\\" is plain text with real line breaks, signed off warmly.\\nReply with ONLY the minified JSON described above — no other text.\";\nconst user=`SEGMENT: ${c.segment} | INTENT: ${c.intent} | PRIORITY: ${c.priority} | SENTIMENT: ${c.sentiment}\\n\\nMANUAL STATUS (authoritative): ${of.opsManual}\\n\\nRECENT OPERATIONAL NOTES: ${of.opsAuto}\\n\\nORDER CONTEXT: ${orderContext||'none'}\\n\\nTHIS THREAD HISTORY (oldest first, latest last):\\n${th}\\n\\nNEW INBOUND EMAIL TO REPLY TO\\nFrom: ${e.fromName} <${e.fromEmail}>\\nSubject: ${e.subject}\\n\\n${e.body}`;\n// Sonnet = quality writer, only reached for genuine actionable mail.\nreturn [{ json:{ anthropicBody:{ model:'claude-sonnet-5', max_tokens:1500, system, messages:[{role:'user',content:user}] }, replyTo:e.fromEmail, threadId:e.threadId, inSubject:e.subject, priority:c.priority } }];"
+      }
+    },
+    {
+      "id": "l2",
+      "name": "Claude Draft",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1480,
+        220
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json.anthropicBody }}",
+        "options": {}
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_ANTHROPIC",
+          "name": "Anthropic API (x-api-key)"
+        }
+      }
+    },
+    {
+      "id": "m3",
+      "name": "Parse Draft",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1680,
+        220
+      ],
+      "parameters": {
+        "jsCode": "const blocks = Array.isArray($json.content) ? $json.content : [];\nlet t = (blocks.find(b => b && b.type === 'text') || {}).text || '{}';\nt = t.replace(/```json/gi,'').replace(/```/g,'').trim();\nconst bd=$('Build Draft Request').item.json; let d; try{d=JSON.parse(t);}catch(e){d={subject:'Re: '+(bd.inSubject||''),body:t,needs_founder_input:true};}\nlet body=d.body||''; if(d.needs_founder_input)body='[HUMAN REVIEW NEEDED BEFORE SENDING]\\n\\n'+body;\nreturn [{ json:{ to:bd.replyTo, threadId:bd.threadId, subject:d.subject||('Re: '+(bd.inSubject||'')), body, priority:bd.priority } }];"
+      }
+    },
+    {
+      "id": "n4",
+      "name": "Gmail: Create Draft",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        1880,
+        220
+      ],
+      "parameters": {
+        "resource": "draft",
+        "operation": "create",
+        "subject": "={{ $json.subject }}",
+        "emailType": "text",
+        "message": "={{ $json.body }}",
+        "options": {
+          "threadId": "={{ $json.threadId }}",
+          "sendTo": "={{ $json.to }}"
+        }
+      },
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "REPLACE_GMAIL",
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "id": "o5",
+      "name": "Gmail: Get Labels",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        2080,
+        220
+      ],
+      "parameters": {
+        "resource": "label",
+        "operation": "getAll",
+        "returnAll": true
+      },
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "REPLACE_GMAIL",
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "id": "q7",
+      "name": "Code: Resolve Label IDs",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2280,
+        220
+      ],
+      "parameters": {
+        "jsCode": "const labels=$input.all().map(i=>i.json).filter(l=>l&&l.name&&l.id); const map={}; for(const l of labels)map[l.name]=l.id;\nconst c=$('Parse Classification').item.json; const threadId=$('Prepare Email').item.json.threadId;\n// EDIT: map each segment to a Gmail label you have created (create these labels first).\nconst segMap={ customer:'AI/Customer', reseller_b2b:'AI/B2B', investor:'AI/Investor', ops_logistics:'AI/Ops' };\nconst wanted=[ segMap[c.segment], 'AI/'+(c.priority||'') ].filter(Boolean);\nconst labelIds=wanted.map(n=>map[n]).filter(Boolean);\nif(!labelIds.length||!threadId)return []; return [{ json:{ threadId, labelIds } }];"
+      }
+    },
+    {
+      "id": "r8",
+      "name": "Gmail: Add Category Labels",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        2480,
+        220
+      ],
+      "parameters": {
+        "resource": "thread",
+        "operation": "addLabels",
+        "threadId": "={{ $json.threadId }}",
+        "labelIds": "={{ $json.labelIds }}"
+      },
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "REPLACE_GMAIL",
+          "name": "Gmail account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Gmail Trigger": {
+      "main": [
+        [
+          {
+            "node": "Prepare Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Email": {
+      "main": [
+        [
+          {
+            "node": "Build Classify Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Classify Request": {
+      "main": [
+        [
+          {
+            "node": "Claude Classify",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claude Classify": {
+      "main": [
+        [
+          {
+            "node": "Parse Classification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Classification": {
+      "main": [
+        [
+          {
+            "node": "IF Actionable",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF Actionable": {
+      "main": [
+        [
+          {
+            "node": "Gmail: Get Thread",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Skip (Noise)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gmail: Get Thread": {
+      "main": [
+        [
+          {
+            "node": "Summarise Thread History",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Summarise Thread History": {
+      "main": [
+        [
+          {
+            "node": "Google Sheets: Read Ops Facts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Sheets: Read Ops Facts": {
+      "main": [
+        [
+          {
+            "node": "Compose Ops Facts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compose Ops Facts": {
+      "main": [
+        [
+          {
+            "node": "IF Needs Order",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF Needs Order": {
+      "main": [
+        [
+          {
+            "node": "Store: Get Orders (example)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Set: No Order Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store: Get Orders (example)": {
+      "main": [
+        [
+          {
+            "node": "Code: Order Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code: Order Context": {
+      "main": [
+        [
+          {
+            "node": "Build Draft Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set: No Order Context": {
+      "main": [
+        [
+          {
+            "node": "Build Draft Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Draft Request": {
+      "main": [
+        [
+          {
+            "node": "Claude Draft",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claude Draft": {
+      "main": [
+        [
+          {
+            "node": "Parse Draft",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Draft": {
+      "main": [
+        [
+          {
+            "node": "Gmail: Create Draft",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gmail: Create Draft": {
+      "main": [
+        [
+          {
+            "node": "Gmail: Get Labels",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gmail: Get Labels": {
+      "main": [
+        [
+          {
+            "node": "Code: Resolve Label IDs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code: Resolve Label IDs": {
+      "main": [
+        [
+          {
+            "node": "Gmail: Add Category Labels",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true
+  },
+  "tags": [
+    {
+      "name": "ai-inbox-autopilot"
+    }
+  ]
+}

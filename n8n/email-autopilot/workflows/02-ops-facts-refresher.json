@@ -1,0 +1,245 @@
+{
+  "name": "AI Inbox Autopilot — Ops Facts Refresher",
+  "nodes": [
+    {
+      "id": "s1",
+      "name": "Schedule (daily)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -600,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "30 7 * * *"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "s2",
+      "name": "Gmail: Recent Sent",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        -380,
+        300
+      ],
+      "parameters": {
+        "resource": "message",
+        "operation": "getAll",
+        "returnAll": false,
+        "limit": 40,
+        "filters": {
+          "q": "in:sent newer_than:7d"
+        },
+        "simple": true
+      },
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "REPLACE_GMAIL",
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "id": "s3",
+      "name": "Compact Sent",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -160,
+        300
+      ],
+      "parameters": {
+        "jsCode": "const lines=$input.all().map(i=>i.json).map(m=>{ const date=m.date||m.internalDate||''; const subj=m.Subject||m.subject||''; const text=String(m.snippet||m.text||'').replace(/\\s+/g,' ').slice(0,200); return `${date} | ${subj} | ${text}`; }).slice(0,60);\nreturn [{ json:{ sentDigest: lines.join('\\n') || 'No recent sent mail.' } }];"
+      }
+    },
+    {
+      "id": "s4",
+      "name": "Build Extract Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        60,
+        300
+      ],
+      "parameters": {
+        "jsCode": "const system=\"You read a week of {{BRAND_NAME}}'s SENT emails and extract only GENERAL, currently-true operational facts we have been telling people: stock/availability, restock ETAs, shipping delays or lead times, and current promotions. STRICT: ignore anything specific to one person or order — no names, no personal commitments, no order numbers, no prices/quotes. Include a fact only if it appears clearly and recently; if statements conflict, keep the most recent. Output 0-8 short bullet lines, each ending with the date last said (YYYY-MM-DD if visible). If nothing qualifies, output exactly: No current operational notes.\";\nconst user='SENT EMAILS (last 7 days):\\n'+($json.sentDigest||'');\nreturn [{ json:{ anthropicBody:{ model:'claude-haiku-4-5-20251001', max_tokens:400, system, messages:[{role:'user',content:user}] } } }];"
+      }
+    },
+    {
+      "id": "s5",
+      "name": "Claude Extract",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        280,
+        300
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json.anthropicBody }}",
+        "options": {}
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_ANTHROPIC",
+          "name": "Anthropic API (x-api-key)"
+        }
+      }
+    },
+    {
+      "id": "s6",
+      "name": "Parse Facts",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        500,
+        300
+      ],
+      "parameters": {
+        "jsCode": "const blocks = Array.isArray($json.content) ? $json.content : [];\nlet t = (blocks.find(b => b && b.type === 'text') || {}).text || 'No current operational notes.';\nt=t.replace(/```/g,'').trim();\nreturn [{ json:{ key:'auto_facts', facts:t } }];"
+      }
+    },
+    {
+      "id": "s7",
+      "name": "Google Sheets: Write auto_facts",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        720,
+        300
+      ],
+      "parameters": {
+        "resource": "sheet",
+        "operation": "appendOrUpdate",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "REPLACE_SHEET_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "facts"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "matchingColumns": [
+            "key"
+          ],
+          "value": {
+            "key": "auto_facts",
+            "value": "={{ $json.facts }}",
+            "updated_at": "={{ $now.toISO() }}"
+          },
+          "schema": []
+        },
+        "options": {}
+      },
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_GSHEETS",
+          "name": "Google Sheets"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Schedule (daily)": {
+      "main": [
+        [
+          {
+            "node": "Gmail: Recent Sent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gmail: Recent Sent": {
+      "main": [
+        [
+          {
+            "node": "Compact Sent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compact Sent": {
+      "main": [
+        [
+          {
+            "node": "Build Extract Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Extract Request": {
+      "main": [
+        [
+          {
+            "node": "Claude Extract",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claude Extract": {
+      "main": [
+        [
+          {
+            "node": "Parse Facts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Facts": {
+      "main": [
+        [
+          {
+            "node": "Google Sheets: Write auto_facts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": [
+    {
+      "name": "ai-inbox-autopilot"
+    }
+  ]
+}
